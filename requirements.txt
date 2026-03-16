@@ -1,0 +1,6 @@
+# Requires Python 3.10+ (openai-agents uses union type syntax)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+openai-agents>=0.8.4
+pydantic>=2.12.3
+python-dotenv>=1.0.1

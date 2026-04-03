@@ -2,9 +2,10 @@
 reference-provider-openclaw
 ----------------------------
 Reference cognition provider using the OpenAI Agents SDK (openai-agents).
-Implements POST /reasoning (ReasoningRequest → ReasoningResult) so it can be
-registered in the cognition-provider-registry and compared against other
-providers in the reasoning-gym.
+Accepts PerceptionFrame-based requests with time-sliced multimodal sensory data.
+Returns motor commands (move, speak, gesture, act) parsed from text output.
+
+This is a REQUEST-RESPONSE provider — the platform calls it on a heartbeat.
 
 Port: 8082 (default)
 
@@ -12,25 +13,15 @@ Env vars:
   OPENAI_API_KEY  — required
   OPENAI_MODEL    — model name (default gpt-4o-mini)
   PORT            — override listen port
-
-Context enrichment (mirrors reference-provider claude mode):
-  - actorContext.displayName          → injected into agent instructions
-  - actorContext.activeGoals          → injected as bullet list
-  - actorContext.metadata.memories    → recent memories injected
-  - actorContext.metadata.world       → world facts injected
-
-Intent proposal:
-  Detects sensitive-action keywords in the input and proposes a structured
-  intent in proposedIntents[]. Mirrors the stub provider behaviour so the
-  reasoning-gym can exercise governance flows regardless of which provider
-  is active.
 """
 
+import json
 import os
 import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 from dotenv import load_dotenv
@@ -52,7 +43,41 @@ if not OPENAI_API_KEY:
 set_default_openai_key(OPENAI_API_KEY)
 
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
+# ── Pydantic models ─────────────────────────────────────────────────────────
+
+class SensoryChannel(BaseModel):
+    facultyId: str
+    modality: str
+    payload: dict[str, Any]
+    sources: list[dict[str, Any]] | None = None
+
+
+class SensorySlice(BaseModel):
+    sliceId: str
+    actorId: str
+    capturedAt: str
+    durationMs: int
+    channels: list[SensoryChannel]
+
+
+class PerceptionFrame(BaseModel):
+    frameId: str
+    actorId: str
+    capturedAt: str
+    slices: list[SensorySlice]
+    memoryContext: list[dict[str, Any]] | None = None
+    selfState: dict[str, Any] | None = None
+    attentionHints: list[str] | None = None
+
+
+class MotorCommand(BaseModel):
+    commandType: str
+    actorId: str
+    move: dict[str, Any] | None = None
+    speak: dict[str, Any] | None = None
+    gesture: dict[str, Any] | None = None
+    act: dict[str, Any] | None = None
+
 
 class ActorContextMeta(BaseModel):
     memories: list[dict[str, Any]] | None = None
@@ -71,97 +96,194 @@ class ActorContext(BaseModel):
 
 class ReasoningRequest(BaseModel):
     actorId: str
-    input: str
+    perceptionFrame: PerceptionFrame | None = None
+    input: str | None = None
     mode: str | None = "ask"
     requestId: str | None = None
     actorContext: ActorContext | None = None
+    availableCapabilities: list[dict[str, str]] | None = None
     model_config = {"extra": "allow"}
 
 
 class ReasoningResult(BaseModel):
     text: str
     requestId: str | None = None
-    confidence: float | None = None
+    motorCommands: list[dict[str, Any]] | None = None
     proposedIntents: list[dict[str, Any]] | None = None
     providerMetadata: dict[str, Any] | None = None
 
 
-# ── Sensitive keyword detection ───────────────────────────────────────────────
+# ── Perception to prompt ─────────────────────────────────────────────────────
 
-SENSITIVE_PATTERNS = [
-    (re.compile(r'\b(delete|remove|clear|wipe)\b.*(wishlist|list|cart|saved)', re.I),
-     "wishlist.items.delete",
-     "User requested deletion of wishlist — irreversible action requiring approval."),
-    (re.compile(r'\b(buy|purchase|order|checkout)\b', re.I),
-     "finance.purchase",
-     "User requested a purchase — financial action requiring approval."),
-    (re.compile(r'\b(transfer|send)\b.*(money|funds|\$|£|€|\d+\s*(usd|eur|gbp))', re.I),
-     "finance.transfer",
-     "User requested a financial transfer — requires approval."),
-    (re.compile(r'\b(cancel|unsubscribe)\b.*(subscription|plan|membership)', re.I),
-     "subscription.cancel",
-     "User requested subscription cancellation — irreversible action requiring approval."),
-]
+def perception_to_prompt(frame: PerceptionFrame, direct_input: str | None = None) -> str:
+    parts: list[str] = []
 
+    if frame.selfState:
+        s = frame.selfState
+        lines: list[str] = []
+        if s.get("status"):
+            lines.append(f"Status: {s['status']}")
+        if s.get("faculties"):
+            lines.append(f"Faculties: {', '.join(s['faculties'])}")
+        if s.get("currentGoals"):
+            lines.append(f"Goals:\n" + "\n".join(f"  - {g}" for g in s["currentGoals"]))
+        if lines:
+            parts.append("## Your State\n" + "\n".join(lines))
 
-def detect_sensitive_intent(actor_id: str, input_text: str) -> dict[str, Any] | None:
-    for pattern, action, rationale in SENSITIVE_PATTERNS:
-        if pattern.search(input_text):
-            return {
-                "intentId": str(uuid.uuid4()),
-                "actorId": actor_id,
-                "action": action,
-                "sensitiveAction": True,
-                "rationale": rationale,
-                "confidence": 0.75,
-            }
-    return None
+    if frame.attentionHints:
+        parts.append("## Attention\n" + "\n".join(f"- {h}" for h in frame.attentionHints))
 
+    if frame.slices:
+        parts.append(f"## Sensory Input ({len(frame.slices)} slices)")
+        for sl in frame.slices:
+            try:
+                t = datetime.fromisoformat(sl.capturedAt.replace("Z", "+00:00")).strftime("%H:%M:%S")
+            except Exception:
+                t = sl.capturedAt
+            ch_descs: list[str] = []
+            for ch in sl.channels:
+                try:
+                    data = json.loads(ch.payload["data"]) if ch.payload.get("format") == "json" else ch.payload.get("data", "")
+                    ch_descs.append(f"[{ch.modality}] {json.dumps(data) if isinstance(data, (dict, list)) else data}")
+                except Exception:
+                    ch_descs.append(f"[{ch.modality}] (data)")
+            if ch_descs:
+                parts.append(f"### {t}\n" + "\n".join(ch_descs))
 
-# ── System prompt construction ────────────────────────────────────────────────
+    if frame.memoryContext:
+        mem_lines = []
+        for m in frame.memoryContext:
+            content = m.get("content", {})
+            text = content.get("text") if isinstance(content, dict) else str(content)
+            mem_lines.append(f"- {text or json.dumps(m)}")
+        parts.append("## Memories\n" + "\n".join(mem_lines))
 
-BASE_PROMPTS = {
-    "ask":     "You are a helpful assistant. Answer the user's question clearly and concisely.",
-    "plan":    "You are a planning assistant. Break the user's goal into a clear, ordered set of steps. Think step by step.",
-    "reflect": "You are a reflective assistant. Review the user's input and provide thoughtful observations, identifying strengths, risks, and improvements.",
-}
-
-
-def build_instructions(req: ReasoningRequest) -> str:
-    base = BASE_PROMPTS.get(req.mode or "ask", BASE_PROMPTS["ask"])
-    parts = [base]
-
-    ctx = req.actorContext
-    if not ctx:
-        return base
-
-    if ctx.displayName:
-        parts.append(f"You are speaking with {ctx.displayName}.")
-    if ctx.actorType:
-        parts.append(f"Actor type: {ctx.actorType}.")
-    if ctx.activeGoals:
-        goals = "\n".join(f"- {g}" for g in ctx.activeGoals)
-        parts.append(f"Actor's active goals:\n{goals}")
-
-    meta = ctx.metadata
-    if meta:
-        if meta.memories:
-            mem_lines = []
-            for m in meta.memories:
-                content = m.get("content", {})
-                text = content.get("text") if isinstance(content, dict) else str(content)
-                mem_type = m.get("memory_type", "memory")
-                mem_lines.append(f"- [{mem_type}] {text or str(m)}")
-            parts.append("Actor's recent memories:\n" + "\n".join(mem_lines))
-
-        if meta.world:
-            fact_lines = "\n".join(f"  {k}: {v}" for k, v in meta.world.items())
-            parts.append(f"Current world context:\n{fact_lines}")
+    if direct_input:
+        parts.append(f'## Direct Input\nThe user says: "{direct_input}"')
 
     return "\n\n".join(parts)
 
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+BASE_SYSTEM_PROMPT = (
+    "You are an embodied agent in a 3D virtual world. You perceive the world through "
+    "time-sliced sensory data and can act through motor commands.\n\n"
+    "When you want to act, describe your intended actions using this exact format (one per line):\n"
+    "  [MOVE] area=commons\n"
+    "  [SPEAK] content=Hello there! volume=normal\n"
+    "  [GESTURE] type=wave\n"
+    '  [ACT] action=calendar.event.create parameters={"title":"Meeting"} rationale=User requested a meeting\n\n'
+    "Always provide natural language text alongside any action commands.\n\n"
+)
+
+MODE_PROMPTS = {
+    "ask": "The user is asking a direct question. Answer concisely.",
+    "plan": "Produce a step-by-step action plan.",
+    "reflect": "Reflect on the situation with observations and recommendations.",
+    "react": "React autonomously to your sensory input. If nothing interesting, observe briefly.",
+}
+
+
+def build_instructions(req: ReasoningRequest) -> str:
+    mode = req.mode or "ask"
+    parts = [BASE_SYSTEM_PROMPT + MODE_PROMPTS.get(mode, MODE_PROMPTS["ask"])]
+
+    ctx = req.actorContext
+    if ctx:
+        if ctx.displayName:
+            parts.append(f"You are speaking with {ctx.displayName}.")
+        if ctx.activeGoals:
+            goals = "\n".join(f"- {g}" for g in ctx.activeGoals)
+            parts.append(f"Goals:\n{goals}")
+        if ctx.metadata and ctx.metadata.memories:
+            mem_lines = []
+            for m in ctx.metadata.memories:
+                content = m.get("content", {})
+                text = content.get("text") if isinstance(content, dict) else str(content)
+                mem_lines.append(f"- [{m.get('memory_type', 'memory')}] {text or str(m)}")
+            parts.append("Memories:\n" + "\n".join(mem_lines))
+
+    if req.availableCapabilities:
+        cap_lines = [f"- {c['action']} [{c.get('sensitivityLevel', 'normal')}]: {c.get('description', '')}" for c in req.availableCapabilities]
+        parts.append("Available actions:\n" + "\n".join(cap_lines))
+
+    return "\n\n".join(parts)
+
+
+# ── Parse motor commands from text ────────────────────────────────────────────
+
+PARAM_RE = re.compile(r"(\w+)=(\{[^}]*\}|[^\s]+)")
+
+MOVE_RE = re.compile(r"^\[MOVE\]\s*(.*)", re.IGNORECASE)
+SPEAK_RE = re.compile(r"^\[SPEAK\]\s*(.*)", re.IGNORECASE)
+GESTURE_RE = re.compile(r"^\[GESTURE\]\s*(.*)", re.IGNORECASE)
+ACT_RE = re.compile(r"^\[ACT\]\s*(.*)", re.IGNORECASE)
+
+
+def parse_params(param_str: str) -> dict[str, str]:
+    return {m.group(1): m.group(2) for m in PARAM_RE.finditer(param_str)}
+
+
+def parse_motor_commands(text: str, actor_id: str) -> tuple[list[dict[str, Any]], str]:
+    commands: list[dict[str, Any]] = []
+    clean_lines: list[str] = []
+
+    for line in text.split("\n"):
+        trimmed = line.strip()
+
+        m = MOVE_RE.match(trimmed)
+        if m:
+            p = parse_params(m.group(1))
+            commands.append({
+                "commandType": "move",
+                "actorId": actor_id,
+                "move": {"target": {k: v for k, v in p.items() if k in ("area", "targetActorId")}, "speed": p.get("speed", "walk")},
+            })
+            continue
+
+        m = SPEAK_RE.match(trimmed)
+        if m:
+            p = parse_params(m.group(1))
+            commands.append({
+                "commandType": "speak",
+                "actorId": actor_id,
+                "speak": {"content": p.get("content", ""), "volume": p.get("volume", "normal")},
+            })
+            continue
+
+        m = GESTURE_RE.match(trimmed)
+        if m:
+            p = parse_params(m.group(1))
+            commands.append({
+                "commandType": "gesture",
+                "actorId": actor_id,
+                "gesture": {"type": p.get("type", "idle")},
+            })
+            continue
+
+        m = ACT_RE.match(trimmed)
+        if m:
+            p = parse_params(m.group(1))
+            params = {}
+            if "parameters" in p:
+                try:
+                    params = json.loads(p["parameters"])
+                except json.JSONDecodeError:
+                    pass
+            commands.append({
+                "commandType": "act",
+                "actorId": actor_id,
+                "act": {"action": p.get("action", ""), "parameters": params, "rationale": p.get("rationale", "")},
+            })
+            continue
+
+        clean_lines.append(line)
+
+    return commands, "\n".join(clean_lines).strip()
+
+
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -173,12 +295,20 @@ app = FastAPI(title="reference-provider-openclaw", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "reference-provider-openclaw", "model": OPENAI_MODEL}
+    return {"ok": True, "service": "reference-provider-openclaw", "model": OPENAI_MODEL, "interactionPattern": "request-response"}
 
 
 @app.post("/reasoning", response_model=ReasoningResult)
 async def reasoning(req: ReasoningRequest):
     instructions = build_instructions(req)
+
+    # Build user message from perception frame and/or direct input
+    if req.perceptionFrame:
+        user_input = perception_to_prompt(req.perceptionFrame, req.input)
+    elif req.input:
+        user_input = req.input
+    else:
+        user_input = "(no input)"
 
     agent = Agent(
         name="openclaw",
@@ -188,23 +318,25 @@ async def reasoning(req: ReasoningRequest):
 
     start = time.monotonic()
     try:
-        result = await Runner.run(agent, req.input)
-        text = result.final_output or ""
+        result = await Runner.run(agent, user_input)
+        raw_text = result.final_output or ""
         duration_ms = int((time.monotonic() - start) * 1000)
 
-        sensitive_intent = detect_sensitive_intent(req.actorId, req.input)
-        proposed_intents = [sensitive_intent] if sensitive_intent else None
+        # Parse motor commands from text
+        motor_commands, clean_text = parse_motor_commands(raw_text, req.actorId)
+
         session_id = req.actorContext.sessionId if req.actorContext else None
 
         return ReasoningResult(
-            text=text,
+            text=clean_text,
             requestId=req.requestId,
-            proposedIntents=proposed_intents,
+            motorCommands=motor_commands if motor_commands else None,
             providerMetadata={
                 "provider": "openclaw",
                 "model": OPENAI_MODEL,
                 "mode": req.mode or "ask",
                 "durationMs": duration_ms,
+                "motorCommandCount": len(motor_commands),
                 **({"sessionId": session_id} if session_id else {}),
             },
         )
